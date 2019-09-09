@@ -8,11 +8,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.context.ApplicationContext;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
 import org.springframework.transaction.support.DefaultTransactionDefinition;
 
 import com.alibaba.fastjson.JSONObject;
@@ -25,10 +27,10 @@ import com.cjy.fat.resolve.CommitResolver;
 @ConditionalOnClass(value= {DataSourceTransactionManager.class})
 public class ServiceRunningHandler {
 	
-	private static final Logger Logger = LoggerFactory.getLogger(ServiceRunningHandler.class);
-
 	@Autowired
-	DataSourceTransactionManager transactionManager;
+	ApplicationContext context;
+	
+	private static final Logger Logger = LoggerFactory.getLogger(ServiceRunningHandler.class);
 
 	@Autowired
 	RedisHelper redisHelper;
@@ -39,6 +41,13 @@ public class ServiceRunningHandler {
 	@Async("transactionResolveExecutor")
 	public void proceed(ProceedingJoinPoint joinPoint,Transactional transactional ,TransactionResolveParam param ,Map<String , String> txData) throws Throwable {
 		this.bulidCunrrentThreadTxAttributesContent(txData);
+		AbstractPlatformTransactionManager transactionManager = null ;
+		String transactionManagerName = transactional.transactionManager();
+		if(StringUtils.isNotBlank(transactionManagerName)) {
+			transactionManager = (AbstractPlatformTransactionManager) context.getBean(transactionManagerName);
+		}else {
+			transactionManager = context.getBean(DataSourceTransactionManager.class);
+		}
 		DefaultTransactionDefinition transDefinition = new DefaultTransactionDefinition();
 		transDefinition.setIsolationLevel(transactional.isolation().value());
 		transDefinition.setPropagationBehavior(transactional.propagation().value());
@@ -49,18 +58,20 @@ public class ServiceRunningHandler {
 			Logger.info("{}-transaction start"  ,param.getLocalTxMark());
 			redisHelper.opsForServiceError().isServiceError(param.getTxKey());
 			Object result = joinPoint.proceed();
-			String resultJSON = JSONObject.toJSONString(result);
-			Logger.info("{}-service is finished , transaction is waiting for commit,service result:{}", param.getLocalTxMark(), resultJSON);
-			// 写入执行结果，提供给其他服务的参数使用 ,改用本地阻塞式队列
-			param.offerToLocalResultQueue(resultJSON);
+			// 写入执行结果返回主线程 ,改用本地阻塞式队列
+			param.offerToLocalResultQueue(result);
+			Logger.info("{}-service is finished , transaction is waiting for commit,service result:{}", param.getLocalTxMark(), JSONObject.toJSONString(result));
 			// 交给事务提交处理器处理可提交逻辑
 			commitResolver.blockProceed(param);
 			transactionManager.commit(transStatus);
 			Logger.info("{}-transaction commit" , param.getLocalTxMark());
 		} catch (Exception e) {
-			transactionManager.rollback(transStatus);
 			redisHelper.opsForServiceError().serviceError(param.getTxKey());
+			if(param.needToNotifyRootTxKey()) {
+				redisHelper.opsForServiceError().serviceError(param.getTxKey());
+			}
 			param.setLocalRunningException(e);
+			transactionManager.rollback(transStatus);
 			Logger.error("{}-transaction rollback ,error:{}", param.getLocalTxMark() , e.getMessage());
 		}
 	}
